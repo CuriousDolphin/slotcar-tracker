@@ -1,3 +1,4 @@
 focoos[gpu,tensorrt] @ git+https://github.com/FocoosAI/focoos.git@v0.5.0
-gradio~=5.9.1
+gradio~=5.10.0
 supervision
+spaces
