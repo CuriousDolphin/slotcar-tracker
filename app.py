@@ -1,5 +1,8 @@
+from dataclasses import dataclass
 from functools import cache
 import os
+import time
+from typing import Optional
 import uuid
 from focoos import Focoos, RuntimeTypes, DEV_API_URL, FocoosDetections
 import gradio as gr
@@ -39,9 +42,110 @@ line_annotator = LineZoneAnnotator(
     thickness=1,
     text_thickness=1,
     text_offset=5,
+    display_in_count=False,
+    display_out_count=False,
 )
 
 smoother = sv.DetectionsSmoother(length=1)
+
+
+@dataclass
+class CarStats:
+    name: str
+    id: int
+    total_laps: int = 0
+    initial_lap_frame: Optional[int] = None
+    last_lap_time: Optional[float] = None
+    best_lap_time: Optional[float] = None
+
+
+class TrackStats:
+    def __init__(self, classes_labels: list[str], fps: int):
+        self.cars = {}
+        self.classes_labels = classes_labels
+        self.fps = fps
+
+    def update(self, line_counter: LineZone, frame_n: int):
+        for car_id, count in line_counter.in_count_per_class.items():
+            if car_id not in self.cars:
+                self.cars[car_id] = CarStats(
+                    name=self.classes_labels[car_id], id=car_id
+                )
+
+            if count != self.cars[car_id].total_laps:  # new lap
+                self.cars[car_id].total_laps = count
+
+                if self.cars[car_id].initial_lap_frame is not None:
+                    time = round(
+                        float(
+                            (frame_n - self.cars[car_id].initial_lap_frame) / self.fps
+                        ),
+                        3,
+                    )
+                    print(
+                        f"elapsed frames: {frame_n - self.cars[car_id].initial_lap_frame} fps: {self.fps} time: {time}"
+                    )
+                    self.cars[car_id].last_lap_time = time
+                self.cars[car_id].initial_lap_frame = frame_n
+
+    def get_best_lap_time(self) -> tuple[Optional[float], Optional[str]]:
+        best_lap_time = None
+        best_car_name = None
+        for car in self.cars.values():
+            if car.last_lap_time is not None and (
+                best_lap_time is None or car.last_lap_time < best_lap_time
+            ):
+                best_lap_time = round(car.last_lap_time, 2)
+                best_car_name = car.name
+        return best_lap_time, best_car_name
+
+    def get_total_laps(self) -> int:
+        return max(car.total_laps for car in self.cars.values()) if self.cars else 0
+
+    def annotate(self, frame: np.ndarray, frame_n: int) -> np.ndarray:
+        for car in self.cars.values():
+            current_time = round(float(frame_n / self.fps), 3)
+            text_laps = f"{car.name}: {car.total_laps} laps"
+            text_time = f"{car.name}: {str(car.last_lap_time)}s"
+            text_size_laps, _ = cv2.getTextSize(
+                text_laps, cv2.FONT_HERSHEY_SIMPLEX, 1, 2
+            )
+            text_size_time, _ = cv2.getTextSize(
+                text_time, cv2.FONT_HERSHEY_SIMPLEX, 1, 2
+            )
+            text_x = frame.shape[1] - text_size_laps[0] - 10
+            text_y = text_size_laps[1] + 10
+            cv2.putText(
+                frame,
+                text_laps,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                text_time,
+                (text_x, text_y + text_size_laps[1] + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                f"time: {current_time}",
+                (text_x, text_y + text_size_laps[1] + 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        return frame
 
 
 def focoos_to_sv(focoos_detections: FocoosDetections) -> sv.Detections:
@@ -112,15 +216,17 @@ def predict(
         end=Point(x=x1, y=y1),
         triggering_anchors=[Position.BOTTOM_LEFT, Position.BOTTOM_RIGHT],
     )
-    classes = model.metadata.classes
-    assert classes is not None
+    classes_labels = model.metadata.classes
+    assert classes_labels is not None
+
     cap = cv2.VideoCapture(video_path)
 
     # This means we will output mp4 videos
     video_codec = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore
     fps = int(cap.get(cv2.CAP_PROP_FPS))
-
     desired_fps = fps // SUBSAMPLE
+    track_stats = TrackStats(classes_labels, fps)
+
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     if width > height:
@@ -138,7 +244,6 @@ def predict(
 
     # Use UUID to create a unique video file
     output_video_name = f"./output/output_{uuid.uuid4()}.mp4"
-    print(output_video_name)
 
     # Output Video
     output_video = cv2.VideoWriter(output_video_name, video_codec, desired_fps, (desired_width, desired_height))  # type: ignore
@@ -163,8 +268,9 @@ def predict(
                 # detections = smoother.update_with_detections(detections)
 
                 line_counter.trigger(detections=detections)
+                track_stats.update(line_counter, n_frames)
                 labels = [
-                    f"{classes[int(class_id)]}: {confid*100:.0f}%"
+                    f"{classes_labels[int(class_id)]}: {confid*100:.0f}%"
                     for class_id, confid in zip(detections.class_id, detections.confidence)  # type: ignore
                 ]
 
@@ -177,16 +283,24 @@ def predict(
                 line_annotator.annotate(
                     frame=annotated_frame, line_counter=line_counter
                 )
-                # frame = frame[:, :, ::-1].copy()
+                # Add label with total laps in the top right corner of the frame
+                annotated_frame = track_stats.annotate(annotated_frame, n_frames)
                 output_video.write(annotated_frame[:, :, ::-1])
             batch = []
             output_video.release()
 
-            yield output_video_name, {"latency(ms)": res.latency.get("inference")}
+            yield output_video_name, {
+                "latency(ms)": res.latency.get("inference"),
+                "total_laps": track_stats.get_total_laps(),
+                "best_lap_time": track_stats.get_best_lap_time(),
+            }
             output_video_name = f"./output/output_{uuid.uuid4()}.mp4"
             output_video = cv2.VideoWriter(output_video_name, video_codec, desired_fps, (desired_width, desired_height))  # type: ignore
         iterating, frame = cap.read()
         n_frames += 1
+    cap.release()
+    print("done")
+    return
 
 
 video_interface = gr.Interface(
