@@ -26,8 +26,9 @@ models = {
     "carrera6 (fcs_det_small)": "6ebb394a93134012",
 }
 
-SUBSAMPLE = 10
-example_video = "./assets/test.mp4"
+SUBSAMPLE = 2
+example_video1 = "./assets/test.mp4"
+example_video2 = "./assets/test2.mp4"
 # TRACKER_WAIT_FRAMES = 200
 
 tracker = sv.ByteTrack(
@@ -37,7 +38,9 @@ tracker = sv.ByteTrack(
     lost_track_buffer=299,
 )
 bounding_box_annotator = sv.BoundingBoxAnnotator()
-label_annotator = sv.LabelAnnotator()
+label_annotator = sv.LabelAnnotator(
+    border_radius=10,
+)
 line_annotator = LineZoneAnnotator(
     thickness=1,
     text_thickness=1,
@@ -46,7 +49,8 @@ line_annotator = LineZoneAnnotator(
     display_out_count=False,
 )
 
-smoother = sv.DetectionsSmoother(length=1)
+triangle_annotator = sv.TriangleAnnotator()
+corner_annotator = sv.BoxCornerAnnotator(thickness=2, corner_length=6)
 
 
 @dataclass
@@ -67,90 +71,119 @@ class TrackStats:
 
     def update(self, line_counter: LineZone, frame_n: int):
         for car_id, count in line_counter.in_count_per_class.items():
-            if car_id not in self.cars:
-                self.cars[car_id] = CarStats(
-                    name=self.classes_labels[car_id], id=car_id
-                )
-
-            if count != self.cars[car_id].total_laps:  # new lap
-                self.cars[car_id].total_laps = count
-
-                if self.cars[car_id].initial_lap_frame is not None:
-                    time = round(
-                        float(
-                            (frame_n - self.cars[car_id].initial_lap_frame) / self.fps
-                        ),
-                        5,
-                    )
+            car = self.cars.setdefault(
+                car_id, CarStats(name=self.classes_labels[car_id], id=car_id)
+            )
+            if count != car.total_laps:  # new lap
+                car.total_laps = count
+                if car.initial_lap_frame is not None:
+                    time = round((frame_n - car.initial_lap_frame) / self.fps, 2)
                     print(
-                        f"new lap time: {time}s initial lap frame: {self.cars[car_id].initial_lap_frame} frame: {frame_n} elapsed frames: {frame_n - self.cars[car_id].initial_lap_frame}"
+                        f"new lap time: {time}s initial lap frame: {car.initial_lap_frame} frame: {frame_n} elapsed frames: {frame_n - car.initial_lap_frame}"
                     )
-                    self.cars[car_id].last_lap_time = time
-                self.cars[car_id].initial_lap_frame = frame_n
-
-    def get_best_lap_time(self) -> tuple[Optional[float], Optional[str]]:
-        best_lap_time = None
-        best_car_name = None
-        for car in self.cars.values():
-            if car.last_lap_time is not None and (
-                best_lap_time is None or car.last_lap_time < best_lap_time
-            ):
-                best_lap_time = round(car.last_lap_time, 2)
-                best_car_name = car.name
-        return best_lap_time, best_car_name
+                    car.last_lap_time = time
+                    if car.best_lap_time is None or time < car.best_lap_time:
+                        car.best_lap_time = time
+                car.initial_lap_frame = frame_n
 
     def get_total_laps(self) -> int:
         return max(car.total_laps for car in self.cars.values()) if self.cars else 0
 
-    def annotate(self, frame: np.ndarray, frame_n: int) -> np.ndarray:
-        current_time_text = f"race time: {round(float(frame_n / self.fps), 1)}"
-        text_size_time, _ = cv2.getTextSize(
-            current_time_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 1
+    def get_best_lap_time_and_car(self) -> tuple[Optional[float], Optional[str]]:
+        _best_lap_time = None
+        _best_car_name = None
+        for car in self.cars.values():
+            if car.best_lap_time is not None and (
+                _best_lap_time is None or car.best_lap_time < _best_lap_time
+            ):
+                _best_lap_time = car.best_lap_time
+                _best_car_name = car.name
+        return _best_lap_time, _best_car_name if _best_lap_time is not None else None
+
+    def _put_text_with_border(
+        self,
+        frame: np.ndarray,
+        text: str,
+        position: tuple,
+        font_scale: float,
+        thickness: int,
+        border_color: tuple[int, int, int] = (0, 0, 0),
+        border_thickness: int = 1,
+        text_color: tuple[int, int, int] = (255, 255, 255),
+        text_thickness: int = 1,
+    ):
+        text_size, _ = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness
         )
-        text_y = text_size_time[1] + 10
+        text_x, text_y = position
         cv2.putText(
             frame,
-            current_time_text,
-            (10, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            1,
+            text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_DUPLEX,
+            font_scale,
+            border_color,
+            thickness + 1,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            frame,
+            text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_DUPLEX,
+            font_scale,
+            text_color,
+            thickness,
+            cv2.LINE_AA,
+        )
+        return text_size
+
+    def annotate(self, frame: np.ndarray, frame_n: int) -> np.ndarray:
+        current_time_text = f"Race time: {round(float(frame_n / self.fps), 1)}s"
+        total_laps_text = f"Total laps: {self.get_total_laps()}"
+
+        text_y = 30
+        text_size_time = self._put_text_with_border(
+            frame, current_time_text, (10, text_y), 1, 1
+        )
+        text_y += text_size_time[1] + 10
+        text_size_laps = self._put_text_with_border(
+            frame, total_laps_text, (10, text_y), 1, 1
+        )
+        text_y += text_size_laps[1] + 10
+        best_lap_time, best_car_name = self.get_best_lap_time_and_car()
+        best_lap_time_text = f"best lap: {best_lap_time if best_lap_time is not None else 'N/A'}s {best_car_name if best_car_name is not None else ''}"
+        text_size_best_lap = self._put_text_with_border(
+            frame,
+            best_lap_time_text,
+            (10, text_y),
+            1,
+            1,
+            text_color=(128, 0, 128),
+            border_color=(128, 0, 128),
+            border_thickness=2,
+        )
+        text_y += text_size_best_lap[1] + 10
 
         for car in self.cars.values():
+            text_name = f"{car.name}"
+            current_lap_time = f"current lap: {round(float((frame_n - car.initial_lap_frame)) / self.fps, 1)}s"
+            text_laps = f"total laps: {car.total_laps}"
+            text_last_lap = f"last lap: {car.last_lap_time if car.last_lap_time is not None else 'N/A'}s"
+            text_best_lap = f"best lap: {car.best_lap_time if car.best_lap_time is not None else 'N/A'}s"
 
-            text_laps = f"{car.name}: {car.total_laps} laps"
-            text_time = f"{car.name}: {str(car.last_lap_time)} s"
-            text_size_laps, _ = cv2.getTextSize(
-                text_laps, cv2.FONT_HERSHEY_SIMPLEX, 1, 1
+            text_size_name = self._put_text_with_border(
+                frame, text_name, (10, text_y), 0.5, 1
             )
-            text_size_time, _ = cv2.getTextSize(
-                text_time, cv2.FONT_HERSHEY_SIMPLEX, 1, 1
-            )
-            text_x = frame.shape[1] - text_size_laps[0] - 10
-            text_y = text_size_laps[1] + 10
-            cv2.putText(
-                frame,
-                text_laps,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame,
-                text_time,
-                (text_x, text_y + text_size_laps[1] + 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            text_y += text_size_name[1] + 10
+            self._put_text_with_border(frame, current_lap_time, (20, text_y), 0.5, 1)
+            text_y += text_size_name[1] + 5
+            self._put_text_with_border(frame, text_laps, (20, text_y), 0.5, 1)
+            text_y += text_size_name[1] + 5
+            self._put_text_with_border(frame, text_last_lap, (20, text_y), 0.5, 1)
+            text_y += text_size_name[1] + 5
+            self._put_text_with_border(frame, text_best_lap, (20, text_y), 0.5, 1)
+            text_y += text_size_name[1] + 5
 
         return frame
 
@@ -203,21 +236,16 @@ def predict(
     y2,
     progress=gr.Progress(),
 ):
-    assert video_path is not None
-    assert model_name is not None
-    assert x1 is not None
-    assert y1 is not None
-    assert x2 is not None
-    assert y2 is not None
+    assert video_path is not None, "video_path is required"
+    assert model_name is not None, "model_name is required"
+    assert x1 is not None, "x1 is required"
+    assert y1 is not None, "y1 is required"
+    assert x2 is not None, "x2 is required"
+    assert y2 is not None, "y2 is required"
 
-    # line_counter = LineZone(
-    #    start=Point(x=x1, y=y1),
-    #    end=Point(x=x2, y=y2),
-    #    triggering_anchors=[Position.BOTTOM_LEFT],
-    # )
     progress(0, desc="load model and warmup...")
     model = load_model(models[model_name])
-    progress(0.1, desc="predicting...")
+    progress(0.1, desc="predicting first batch...")
     line_counter = LineZone(
         start=Point(x=x2, y=y2),
         end=Point(x=x1, y=y1),
@@ -236,14 +264,18 @@ def predict(
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if width > height:
-        desired_width = 640
-        desired_height = int((height / width) * 640)
-    else:
-        desired_height = 640
-        desired_width = int((width / height) * 640)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # if width > height:
+    #     desired_width = 640
+    #     desired_height = int((height / width) * 640)
+    # else:
+    #     desired_height = 640
+    #     desired_width = int((width / height) * 640)
+
+    desired_height = height
+    desired_width = width
     print(
-        f"video: {video_path} fps: {fps}, desired_fps: {desired_fps}, width: {desired_width}, height: {desired_height}"
+        f"video: {video_path} fps: {fps}, total_frames: {total_frames}, desired_fps: {desired_fps}, width: {desired_width}, height: {desired_height}"
     )
     iterating, frame = cap.read()
 
@@ -255,8 +287,8 @@ def predict(
     # Output Video
     output_video = cv2.VideoWriter(output_video_name, video_codec, desired_fps, (desired_width, desired_height))  # type: ignore
     batch = []
-
     while iterating:
+
         if not cap.isOpened():
             print("Video ended")
             break
@@ -265,16 +297,14 @@ def predict(
             continue
         frame = cv2.resize(frame, (desired_width, desired_height))
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # print(f"frame: {n_frames}")
         res, _ = model.infer(frame, threshold=threshold, annotate=False)
 
         detections = focoos_to_sv(res)
-        # detections = smoother.update_with_detections(detections)
 
         line_counter.trigger(detections=detections)
         track_stats.update(line_counter, n_frames)
         labels = [
-            f"{classes_labels[int(class_id)]}: {confid*100:.0f}%"
+            f"{classes_labels[int(class_id)]}"
             for class_id, confid in zip(detections.class_id, detections.confidence)  # type: ignore
         ]
 
@@ -297,10 +327,11 @@ def predict(
 
             output_video.release()
             print(f"writed video: {output_video_name} batch size: {len(batch)}")
+            best_lap_time, best_car_name = track_stats.get_best_lap_time_and_car()
             yield output_video_name, {
                 "latency(ms)": res.latency.get("inference"),
                 "total_laps": track_stats.get_total_laps(),
-                "best_lap_time": track_stats.get_best_lap_time(),
+                "best_lap_time": f"{best_lap_time}s {best_car_name}",
             }
             batch = []
             output_video_name = f"./output/output_{uuid.uuid4()}.mp4"
@@ -322,10 +353,19 @@ video_interface = gr.Interface(
         gr.Number(label="x2"),
         gr.Number(label="y2"),
     ],
-    flagging_mode="manual",
+    flagging_mode="never",
     outputs=[gr.Video(streaming=True, autoplay=True, format="mp4"), gr.JSON()],
     examples=[
-        [example_video, "carrera6 (fcs_det_small)", 0.6, 190, 280, 255, 340],
+        [
+            example_video1,
+            "carrera6 (fcs_det_small)",
+            0.6,
+            380,
+            560,
+            510,
+            680,
+        ],  # 380, 560, 510, 680
+        [example_video2, "carrera6 (fcs_det_small)", 0.6, 515, 620, 600, 540],
     ],
     description="Upload a video to track slot cars.",
 )
@@ -343,6 +383,7 @@ live_rtsp_interface = gr.Interface(
     ],
     outputs=[gr.Video(streaming=True, autoplay=True), gr.JSON()],
     description="Track slot cars from an RTSP stream.",
+    allow_flagging="never",
 )
 
 
