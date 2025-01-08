@@ -26,7 +26,7 @@ models = {
     "carrera6 (fcs_det_small)": "6ebb394a93134012",
 }
 
-SUBSAMPLE = 2
+SUBSAMPLE = 10
 example_video = "./assets/test.mp4"
 # TRACKER_WAIT_FRAMES = 200
 
@@ -80,10 +80,10 @@ class TrackStats:
                         float(
                             (frame_n - self.cars[car_id].initial_lap_frame) / self.fps
                         ),
-                        3,
+                        5,
                     )
                     print(
-                        f"elapsed frames: {frame_n - self.cars[car_id].initial_lap_frame} fps: {self.fps} time: {time}"
+                        f"new lap time: {time}s initial lap frame: {self.cars[car_id].initial_lap_frame} frame: {frame_n} elapsed frames: {frame_n - self.cars[car_id].initial_lap_frame}"
                     )
                     self.cars[car_id].last_lap_time = time
                 self.cars[car_id].initial_lap_frame = frame_n
@@ -103,15 +103,31 @@ class TrackStats:
         return max(car.total_laps for car in self.cars.values()) if self.cars else 0
 
     def annotate(self, frame: np.ndarray, frame_n: int) -> np.ndarray:
+        current_time_text = f"race time: {round(float(frame_n / self.fps), 1)}"
+        text_size_time, _ = cv2.getTextSize(
+            current_time_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 1
+        )
+        text_y = text_size_time[1] + 10
+        cv2.putText(
+            frame,
+            current_time_text,
+            (10, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
         for car in self.cars.values():
-            current_time = round(float(frame_n / self.fps), 3)
+
             text_laps = f"{car.name}: {car.total_laps} laps"
-            text_time = f"{car.name}: {str(car.last_lap_time)}s"
+            text_time = f"{car.name}: {str(car.last_lap_time)} s"
             text_size_laps, _ = cv2.getTextSize(
-                text_laps, cv2.FONT_HERSHEY_SIMPLEX, 1, 2
+                text_laps, cv2.FONT_HERSHEY_SIMPLEX, 1, 1
             )
             text_size_time, _ = cv2.getTextSize(
-                text_time, cv2.FONT_HERSHEY_SIMPLEX, 1, 2
+                text_time, cv2.FONT_HERSHEY_SIMPLEX, 1, 1
             )
             text_x = frame.shape[1] - text_size_laps[0] - 10
             text_y = text_size_laps[1] + 10
@@ -122,7 +138,7 @@ class TrackStats:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
                 (255, 255, 255),
-                2,
+                1,
                 cv2.LINE_AA,
             )
             cv2.putText(
@@ -132,19 +148,10 @@ class TrackStats:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
                 (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame,
-                f"time: {current_time}",
-                (text_x, text_y + text_size_laps[1] + 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
                 1,
-                (255, 255, 255),
-                2,
                 cv2.LINE_AA,
             )
+
         return frame
 
 
@@ -214,7 +221,7 @@ def predict(
     line_counter = LineZone(
         start=Point(x=x2, y=y2),
         end=Point(x=x1, y=y1),
-        triggering_anchors=[Position.BOTTOM_LEFT, Position.BOTTOM_RIGHT],
+        triggering_anchors=[Position.BOTTOM_LEFT],
     )
     classes_labels = model.metadata.classes
     assert classes_labels is not None
@@ -224,7 +231,7 @@ def predict(
     # This means we will output mp4 videos
     video_codec = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore
     fps = int(cap.get(cv2.CAP_PROP_FPS))
-    desired_fps = fps // SUBSAMPLE
+    desired_fps = fps
     track_stats = TrackStats(classes_labels, fps)
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -258,44 +265,45 @@ def predict(
             continue
         frame = cv2.resize(frame, (desired_width, desired_height))
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        if n_frames % SUBSAMPLE == 0:
-            batch.append(frame)
-        if len(batch) == 2 * desired_fps:
+        # print(f"frame: {n_frames}")
+        res, _ = model.infer(frame, threshold=threshold, annotate=False)
+
+        detections = focoos_to_sv(res)
+        # detections = smoother.update_with_detections(detections)
+
+        line_counter.trigger(detections=detections)
+        track_stats.update(line_counter, n_frames)
+        labels = [
+            f"{classes_labels[int(class_id)]}: {confid*100:.0f}%"
+            for class_id, confid in zip(detections.class_id, detections.confidence)  # type: ignore
+        ]
+
+        annotated_frame = bounding_box_annotator.annotate(
+            scene=frame.copy(), detections=detections
+        )
+        annotated_frame = label_annotator.annotate(
+            scene=annotated_frame, detections=detections, labels=labels
+        )
+        line_annotator.annotate(frame=annotated_frame, line_counter=line_counter)
+        # Add label with total laps in the top right corner of the frame
+        annotated_frame = track_stats.annotate(annotated_frame, n_frames)
+        batch.append(annotated_frame.copy())
+
+        if len(batch) == SUBSAMPLE * desired_fps:
+            output_video = cv2.VideoWriter(output_video_name, video_codec, desired_fps, (desired_width, desired_height))  # type: ignore
+
             for frame in batch:
-                res, _ = model.infer(frame, threshold=threshold, annotate=False)
+                output_video.write(frame[:, :, ::-1])
 
-                detections = focoos_to_sv(res)
-                # detections = smoother.update_with_detections(detections)
-
-                line_counter.trigger(detections=detections)
-                track_stats.update(line_counter, n_frames)
-                labels = [
-                    f"{classes_labels[int(class_id)]}: {confid*100:.0f}%"
-                    for class_id, confid in zip(detections.class_id, detections.confidence)  # type: ignore
-                ]
-
-                annotated_frame = bounding_box_annotator.annotate(
-                    scene=frame.copy(), detections=detections
-                )
-                annotated_frame = label_annotator.annotate(
-                    scene=annotated_frame, detections=detections, labels=labels
-                )
-                line_annotator.annotate(
-                    frame=annotated_frame, line_counter=line_counter
-                )
-                # Add label with total laps in the top right corner of the frame
-                annotated_frame = track_stats.annotate(annotated_frame, n_frames)
-                output_video.write(annotated_frame[:, :, ::-1])
-            batch = []
             output_video.release()
-
+            print(f"writed video: {output_video_name} batch size: {len(batch)}")
             yield output_video_name, {
                 "latency(ms)": res.latency.get("inference"),
                 "total_laps": track_stats.get_total_laps(),
                 "best_lap_time": track_stats.get_best_lap_time(),
             }
+            batch = []
             output_video_name = f"./output/output_{uuid.uuid4()}.mp4"
-            output_video = cv2.VideoWriter(output_video_name, video_codec, desired_fps, (desired_width, desired_height))  # type: ignore
         iterating, frame = cap.read()
         n_frames += 1
     cap.release()
