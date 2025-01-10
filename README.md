@@ -20,7 +20,7 @@ The currently supported slot cars are:
 **Actually models are private and not available for public use**.
 
 Proprietary detection models are provided and trained with the **FocoosAI platform** (COMING SOON 🚀🚀):
-[FocoosAI](https://focoosai.com), models are available with differents runtimes:
+[FocoosAI](https://focoos.ai), models are available with differents runtimes:
 
 - onnxruntime-cuda
 - onnxruntime-tensorrt-fp32
