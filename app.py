@@ -1,7 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from functools import cache
 import os
-import time
 from typing import Optional
 import uuid
 from focoos import Focoos, RuntimeTypes, DEV_API_URL, FocoosDetections
@@ -29,14 +28,16 @@ models = {
 SUBSAMPLE = 2
 example_video1 = "./assets/test.mp4"
 example_video2 = "./assets/test2.mp4"
-# TRACKER_WAIT_FRAMES = 200
+example_image1 = "./assets/image1.jpg"
+example_image2 = "./assets/image2.jpg"
+example_image3 = "./assets/image3.jpg"
 
-tracker = sv.ByteTrack(
-    frame_rate=30,
-    minimum_matching_threshold=0.1,
-    track_activation_threshold=0.1,
-    lost_track_buffer=299,
-)
+# tracker = sv.ByteTrack(
+#     frame_rate=30,
+#     minimum_matching_threshold=0.1,
+#     track_activation_threshold=0.1,
+#     lost_track_buffer=299,
+# )
 bounding_box_annotator = sv.BoundingBoxAnnotator()
 label_annotator = sv.LabelAnnotator(
     border_radius=10,
@@ -108,9 +109,7 @@ class TrackStats:
         font_scale: float,
         thickness: int,
         border_color: tuple[int, int, int] = (0, 0, 0),
-        border_thickness: int = 1,
         text_color: tuple[int, int, int] = (255, 255, 255),
-        text_thickness: int = 1,
     ):
         text_size, _ = cv2.getTextSize(
             text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness
@@ -161,7 +160,6 @@ class TrackStats:
             1,
             text_color=(128, 0, 128),
             border_color=(128, 0, 128),
-            border_thickness=2,
         )
         text_y += text_size_best_lap[1] + 10
 
@@ -206,7 +204,7 @@ def focoos_to_sv(focoos_detections: FocoosDetections) -> sv.Detections:
             if len(detections) > 0
             else np.array([])
         ),
-        tracker_id=(
+        tracker_id=(  # fake tracker id, we don't realy need it for tracking
             np.array([det.cls_id for det in detections])
             if len(detections) > 0
             else np.array([])
@@ -216,13 +214,49 @@ def focoos_to_sv(focoos_detections: FocoosDetections) -> sv.Detections:
 
 
 @cache
-def load_model(model_name: str):
+def load_model(model_name: str, runtime_type: RuntimeTypes = RuntimeTypes.ONNX_CUDA32):
     client = Focoos(api_key=os.getenv("FOCOOS_API_KEY") or "", host_url=DEV_API_URL)
     model = client.get_local_model(
         model_ref=model_name,
-        runtime_type=RuntimeTypes.ONNX_CUDA32,
+        runtime_type=runtime_type,
     )
     return model
+
+
+@spaces.GPU
+def benchmark_model(
+    model_name: str,
+    iterations: int,
+    runtime: RuntimeTypes,
+    progress=gr.Progress(),
+):
+    assert model_name is not None, "model_name is required"
+    assert model_name in models, "model_name is not valid"
+    assert iterations is not None, "iterations is required"
+    assert runtime is not None, "runtime is required"
+
+    progress(0, desc="load and warmup model...")
+    model = load_model(models[model_name], runtime_type=runtime)
+    progress(0.5, desc="benchmarking model...")
+    result = model.benchmark(iterations=iterations, size=640)
+    progress(1, desc="benchmarking model done")
+    return asdict(result)
+
+
+@spaces.GPU
+def predict_image(
+    image: np.ndarray, model_name: str, threshold: float, progress=gr.Progress()
+):
+    assert image is not None, "image is required"
+    assert model_name is not None, "model_name is required"
+    assert model_name in models, "model_name is not valid"
+    assert threshold is not None, "threshold is required"
+    progress(0, desc="load model and warmup...")
+    model = load_model(models[model_name])
+    progress(0.1, desc="predicting...")
+    res, preview = model.infer(image, threshold=threshold, annotate=True)
+    progress(1, desc="predicting done")
+    return preview, res.model_dump()
 
 
 @spaces.GPU
@@ -234,10 +268,12 @@ def predict(
     y1,
     x2,
     y2,
+    resize_ratio_output_video,
     progress=gr.Progress(),
 ):
     assert video_path is not None, "video_path is required"
     assert model_name is not None, "model_name is required"
+    assert model_name in models, "model_name is not valid"
     assert x1 is not None, "x1 is required"
     assert y1 is not None, "y1 is required"
     assert x2 is not None, "x2 is required"
@@ -265,15 +301,10 @@ def predict(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    # if width > height:
-    #     desired_width = 640
-    #     desired_height = int((height / width) * 640)
-    # else:
-    #     desired_height = 640
-    #     desired_width = int((width / height) * 640)
 
-    desired_height = height
-    desired_width = width
+    desired_width = int(width * resize_ratio_output_video)
+    desired_height = int(height * resize_ratio_output_video)
+
     print(
         f"video: {video_path} fps: {fps}, total_frames: {total_frames}, desired_fps: {desired_fps}, width: {desired_width}, height: {desired_height}"
     )
@@ -346,12 +377,13 @@ video_interface = gr.Interface(
     fn=predict,
     inputs=[
         gr.Video(),
-        gr.Dropdown(list(models.keys())),
-        gr.Slider(0, 1, 0.5),
+        gr.Dropdown(label="model", choices=list(models.keys())),
+        gr.Slider(label="confidence threshold", minimum=0, maximum=1, value=0.5),
         gr.Number(label="x1"),
         gr.Number(label="y1"),
         gr.Number(label="x2"),
         gr.Number(label="y2"),
+        gr.Slider(label="resize_ratio_output_video", minimum=0, maximum=1, value=0.5),
     ],
     flagging_mode="never",
     outputs=[gr.Video(streaming=True, autoplay=True, format="mp4"), gr.JSON()],
@@ -364,8 +396,9 @@ video_interface = gr.Interface(
             560,
             510,
             680,
+            0.5,
         ],  # 380, 560, 510, 680
-        [example_video2, "carrera6 (fcs_det_small)", 0.6, 515, 620, 600, 540],
+        [example_video2, "carrera6 (fcs_det_small)", 0.6, 515, 620, 600, 540, 0.5],
     ],
     description="Upload a video to track slot cars.",
 )
@@ -374,24 +407,67 @@ live_rtsp_interface = gr.Interface(
     fn=predict,
     inputs=[
         gr.Textbox(label="RTSP URL"),
-        gr.Dropdown(list(models.keys())),
-        gr.Slider(0, 1, 0.5),
+        gr.Dropdown(label="Model", choices=list(models.keys())),
+        gr.Slider(label="Confidence threshold", minimum=0, maximum=1, value=0.5),
         gr.Number(label="x1"),
         gr.Number(label="y1"),
         gr.Number(label="x2"),
         gr.Number(label="y2"),
+        gr.Slider(label="Resize ratio output video", minimum=0, maximum=1, value=0.5),
     ],
     outputs=[gr.Video(streaming=True, autoplay=True), gr.JSON()],
     description="Track slot cars from an RTSP stream.",
     allow_flagging="never",
 )
 
+benchmark_interface = gr.Interface(
+    fn=benchmark_model,
+    inputs=[
+        gr.Dropdown(label="Model", choices=list(models.keys())),
+        gr.Slider(label="Iterations", minimum=1, maximum=100, value=100),
+        gr.Dropdown(
+            label="Runtime",
+            info="Note: TensorRT runtimes have slower warmup times due to engine compilation.",
+            choices=[rt for rt in RuntimeTypes if rt != RuntimeTypes.ONNX_COREML],
+        ),
+    ],
+    outputs=[gr.JSON()],
+    description="Benchmark FocoosAI models.",
+    allow_flagging="never",
+)
+
+image_interface = gr.Interface(
+    fn=predict_image,
+    inputs=[
+        gr.Image(type="numpy"),
+        gr.Dropdown(label="Model", choices=list(models.keys())),
+        gr.Slider(label="Confidence threshold", minimum=0, maximum=1, value=0.5),
+    ],
+    outputs=[gr.Image(type="numpy"), gr.JSON()],
+    description="Benchmark FocoosAI models.",
+    allow_flagging="never",
+    examples=[
+        [example_image1, "carrera1 (fcs_rtdetr)", 0.5],
+        [example_image2, "carrera6 (fcs_det_small)", 0.5],
+        [example_image3, "carrera6 (fcs_det_small)", 0.5],
+    ],
+)
 
 demo = gr.TabbedInterface(
-    title="Slot car tracker (powered by FocoosAI)",
-    interface_list=[video_interface, live_rtsp_interface],
-    tab_names=["Video", "Live"],
+    title="Slot car tracker (powered by www.focoos.ai)",
+    interface_list=[
+        video_interface,
+        live_rtsp_interface,
+        image_interface,
+        benchmark_interface,
+    ],
+    tab_names=[
+        "Video Inference",
+        "Live (rtsp) Inference",
+        "Image Inference",
+        "Benchmark",
+    ],
 )
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch()
